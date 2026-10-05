@@ -33,12 +33,32 @@ def _validate_venue(actor, data, lookup):
     return {}
 
 
+def _validate_admission_batch(actor, data, lookup):
+    if not str(data.get("batch_no", "")).strip():
+        raise ValidationError("batch_no is required")
+    try:
+        count = int(data.get("count"))
+    except (TypeError, ValueError):
+        raise ValidationError("batch count must be an integer")
+    if count <= 0:
+        raise ValidationError("batch count must be positive")
+    gate = _find_one(lookup, "gate", "id", data.get("gate_id"))
+    if not gate:
+        raise ValidationError("gate does not exist")
+    zone = _find_one(lookup, "zone", "id", data.get("zone_id"))
+    if not zone:
+        raise ValidationError("zone does not exist")
+    if zone["id"] not in (gate["data"].get("zone_ids") or []):
+        raise ValidationError("gate does not serve this zone")
+    return {}
+
+
 def _validate_zone(actor, data, lookup):
     if not _find_one(lookup, "venue", "id", data.get("venue_id")):
         raise ValidationError("venue does not exist")
     if int(data.get("capacity", 0)) <= 0:
         raise ValidationError("zone capacity must be positive")
-    return {"current_occupancy": 0}
+    return {"current_occupancy": 0, "over_capacity": False}
 
 
 def _validate_gate(actor, data, lookup):
@@ -155,6 +175,7 @@ class RuleEngine:
         "medical_points": "medical_point",
         "incidents": "incident",
         "tasks": "task",
+        "admission_batches": "admission_batch",
     }
     INITIAL_STATUS = {
         "venue": "ready",
@@ -164,6 +185,7 @@ class RuleEngine:
         "medical_point": "standby",
         "incident": "reported",
         "task": "draft",
+        "admission_batch": "pending",
     }
     TRANSITIONS = {
         "venue": {
@@ -218,6 +240,7 @@ class RuleEngine:
         "medical_point": ("venue_id", "zone_id", "capacity", "equipment_level"),
         "incident": ("venue_id", "zone_id", "source_ref", "incident_type", "severity", "reported_at"),
         "task": ("incident_id", "venue_id", "zone_id", "team_id", "task_type"),
+        "admission_batch": ("gate_id", "zone_id", "count", "batch_no", "admitted_at"),
     }
     ACTION_REQUIRED = {
         ("venue", "limit"): ("reason", "capacity_limit"),
@@ -253,6 +276,7 @@ class RuleEngine:
         "medical_point": ("supervisor", "coordinator", "admin"),
         "incident": ("operator", "supervisor", "coordinator", "admin"),
         "task": ("supervisor", "coordinator", "admin"),
+        "admission_batch": ("operator", "supervisor", "admin"),
     }
     ROLE_ACTIONS = {
         "limit": ("coordinator", "supervisor", "admin"),
@@ -285,6 +309,7 @@ class RuleEngine:
         "medical_point": _validate_medical_point,
         "incident": _validate_incident,
         "task": _validate_task,
+        "admission_batch": _validate_admission_batch,
     }
     CUSTOM_TRANSITIONS = {
         ("zone", "admit"): _validate_zone_admit,

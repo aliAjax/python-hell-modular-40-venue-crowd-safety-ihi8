@@ -1,8 +1,9 @@
 import json
 import sqlite3
 from datetime import datetime, timezone
+from uuid import uuid4
 
-from .domain import ConflictError, NotFoundError
+from .domain import ConflictError, NotFoundError, ValidationError
 
 
 def utcnow():
@@ -54,6 +55,9 @@ class SQLiteRepository:
                     created_at TEXT NOT NULL,
                     PRIMARY KEY(actor_id, idem_key)
                 );
+                CREATE UNIQUE INDEX IF NOT EXISTS idx_entities_batch_no
+                    ON entities(json_extract(data, '$.batch_no'))
+                    WHERE kind = 'admission_batch';
             """)
 
     @staticmethod
@@ -195,6 +199,171 @@ class SQLiteRepository:
                 "VALUES (?, ?, ?, ?)",
                 (actor_id, idem_key, entity_id, utcnow()),
             )
+
+    def find_batch_by_no(self, batch_no):
+        with self._connect() as connection:
+            row = connection.execute(
+                "SELECT * FROM entities WHERE kind = 'admission_batch' "
+                "AND json_extract(data, '$.batch_no') = ?",
+                (batch_no,),
+            ).fetchone()
+        return self._entity_from_row(row) if row else None
+
+    def return_admission_batch(self, *, batch_no, gate_id, zone_id, count, admitted_at, actor_id, allowed_statuses):
+        """Atomically find-or-create a pending batch, reconcile zone occupancy, and mark the batch returned.
+
+        Runs in a single BEGIN IMMEDIATE transaction so concurrent gates serialize on the latest
+        committed occupancy; a duplicate batch_no resolves to the already-returned batch (idempotent).
+        Raises ConflictError if the batch was voided or the zone is not accepting admissions.
+        """
+        now = utcnow()
+        connection = self._connect()
+        try:
+            connection.execute("BEGIN IMMEDIATE")
+            brow = connection.execute(
+                "SELECT * FROM entities WHERE kind = 'admission_batch' "
+                "AND json_extract(data, '$.batch_no') = ?",
+                (batch_no,),
+            ).fetchone()
+            if brow:
+                batch = self._entity_from_row(brow)
+                if batch["status"] == "returned":
+                    if batch["data"].get("gate_id") != gate_id or batch["data"].get("zone_id") != zone_id:
+                        raise ConflictError(
+                            "batch_no %s already registered for a different gate/zone" % batch_no
+                        )
+                    connection.commit()
+                    return {
+                        "batch": batch,
+                        "zone": self.get_entity(zone_id),
+                        "idempotent": True,
+                        "created": False,
+                    }
+                if batch["status"] == "void":
+                    raise ConflictError("batch has been voided: " + batch_no)
+                if batch["data"].get("gate_id") != gate_id or batch["data"].get("zone_id") != zone_id:
+                    raise ConflictError(
+                        "batch_no %s already registered for a different gate/zone" % batch_no
+                    )
+            else:
+                batch = None
+            zrow = connection.execute(
+                "SELECT * FROM entities WHERE id = ?", (zone_id,)
+            ).fetchone()
+            if not zrow:
+                raise NotFoundError("zone not found: " + zone_id)
+            zone = self._entity_from_row(zrow)
+            if zone["kind"] != "zone":
+                raise ValidationError("entity is not a zone: " + zone_id)
+            if zone["status"] not in allowed_statuses:
+                raise ConflictError(
+                    "zone is not accepting admissions (status: %s)" % zone["status"]
+                )
+            capacity = int(zone["data"].get("capacity", 0))
+            occupancy = int(zone["data"].get("current_occupancy", 0))
+            new_occupancy = occupancy + int(count)
+            excess = max(0, new_occupancy - capacity)
+            zone_data = dict(zone["data"])
+            zone_data["current_occupancy"] = new_occupancy
+            zone_data["over_capacity"] = excess > 0
+            connection.execute(
+                "UPDATE entities SET version = version + 1, data = ?, updated_at = ? WHERE id = ?",
+                (json.dumps(zone_data, ensure_ascii=False, sort_keys=True), now, zone["id"]),
+            )
+            batch_data = {
+                "batch_no": batch_no,
+                "gate_id": gate_id,
+                "zone_id": zone_id,
+                "count": int(count),
+                "admitted_at": admitted_at,
+                "exceeded_capacity": excess > 0,
+                "excess_count": excess,
+                "reviewed": False,
+                "returned_at": now,
+            }
+            batch_payload = json.dumps(batch_data, ensure_ascii=False, sort_keys=True)
+            if batch:
+                connection.execute(
+                    "UPDATE entities SET status = 'returned', version = version + 1, data = ?, updated_at = ? "
+                    "WHERE id = ?",
+                    (batch_payload, now, batch["id"]),
+                )
+                batch_id = batch["id"]
+                created = False
+            else:
+                batch_id = str(uuid4())
+                connection.execute(
+                    "INSERT INTO entities(id, kind, status, version, data, created_by, created_at, updated_at) "
+                    "VALUES (?, 'admission_batch', 'returned', 1, ?, ?, ?, ?)",
+                    (batch_id, batch_payload, actor_id, now, now),
+                )
+                created = True
+            connection.commit()
+        except Exception:
+            connection.rollback()
+            raise
+        finally:
+            connection.close()
+        return {
+            "batch": self.get_entity(batch_id),
+            "zone": self.get_entity(zone_id),
+            "idempotent": False,
+            "created": created,
+        }
+
+    def void_pending_batches(self, zone_id):
+        now = utcnow()
+        with self._connect() as connection:
+            cursor = connection.execute(
+                "UPDATE entities SET status = 'void', version = version + 1, updated_at = ? "
+                "WHERE kind = 'admission_batch' AND status = 'pending' "
+                "AND json_extract(data, '$.zone_id') = ?",
+                (now, zone_id),
+            )
+            return cursor.rowcount
+
+    def backfill_zone_occupancy(self):
+        """Reconcile each zone's current_occupancy from its returned admission batches.
+
+        Used when upgrading an old database: occupancy is recomputed as the sum of counts of
+        returned batches, so the on-site headcount matches the reconciled batch records.
+        """
+        now = utcnow()
+        connection = self._connect()
+        updated = []
+        try:
+            connection.execute("BEGIN IMMEDIATE")
+            rows = connection.execute(
+                "SELECT json_extract(data, '$.zone_id') AS zone_id, "
+                "SUM(CAST(json_extract(data, '$.count') AS INTEGER)) AS total "
+                "FROM entities WHERE kind = 'admission_batch' AND status = 'returned' "
+                "AND json_extract(data, '$.zone_id') IS NOT NULL "
+                "GROUP BY zone_id"
+            ).fetchall()
+            for row in rows:
+                zone_id = row["zone_id"]
+                total = int(row["total"] or 0)
+                zrow = connection.execute(
+                    "SELECT * FROM entities WHERE id = ?", (zone_id,)
+                ).fetchone()
+                if not zrow:
+                    continue
+                zone = self._entity_from_row(zrow)
+                data = dict(zone["data"])
+                data["current_occupancy"] = total
+                data["over_capacity"] = total > int(data.get("capacity", 0))
+                connection.execute(
+                    "UPDATE entities SET version = version + 1, data = ?, updated_at = ? WHERE id = ?",
+                    (json.dumps(data, ensure_ascii=False, sort_keys=True), now, zone_id),
+                )
+                updated.append({"zone_id": zone_id, "occupancy": total})
+            connection.commit()
+        except Exception:
+            connection.rollback()
+            raise
+        finally:
+            connection.close()
+        return updated
 
     def ping(self):
         with self._connect() as connection:

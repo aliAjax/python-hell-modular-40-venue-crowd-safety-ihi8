@@ -6,6 +6,7 @@ from src.http_api import create_server
 from src.repository import SQLiteRepository
 from src.rules import RuleEngine
 from src.service import DomainService
+from src.domain import Actor
 
 
 def main(argv=None):
@@ -13,11 +14,15 @@ def main(argv=None):
     parser.add_argument("--db", default="./data.db", help="SQLite database path")
     parser.add_argument("--host", default="127.0.0.1")
     parser.add_argument("--port", type=int, default=8340)
+    parser.add_argument("--backfill", action="store_true", help="升级旧库时按已回传批次回填区域在场人数")
     args = parser.parse_args(argv)
 
     repository = SQLiteRepository(args.db)
     rules = RuleEngine()
     service = DomainService(repository, rules)
+    if args.backfill:
+        updated = service.backfill_occupancy(Actor("system", "admin"))
+        print("backfilled occupancy for %d zone(s)" % len(updated), flush=True)
     server = create_server(
         args.host,
         args.port,

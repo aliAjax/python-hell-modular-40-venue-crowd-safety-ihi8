@@ -84,6 +84,8 @@ def create_handler(service, rules, static_dir):
                         return self._send_html(200, handle.read())
                 if parts == ["api", "audit"]:
                     return self._send(200, {"items": service.audit_log()})
+                if parts == ["api", "admission_batches", "review"]:
+                    return self._send(200, {"items": service.list_review_batches()})
                 if len(parts) == 3 and parts[:2] == ["api", "entities"]:
                     return self._send(200, service.get(parts[2]))
                 if len(parts) >= 2 and parts[0] == "api":
@@ -138,6 +140,12 @@ def create_handler(service, rules, static_dir):
                         200,
                         service.transition(actor, parts[2], parts[3], self._body(), None),
                     )
+                if len(parts) == 3 and parts[:2] == ["api", "admission_batches"] and parts[2] == "return":
+                    return self._send(200, service.return_batch(actor, self._body()))
+                if len(parts) == 4 and parts[:2] == ["api", "admission_batches"] and parts[3] == "review":
+                    return self._send(200, service.review_batch(actor, parts[2], self._body()))
+                if len(parts) == 3 and parts[:2] == ["api", "ops"] and parts[2] == "backfill_occupancy":
+                    return self._send(200, {"items": service.backfill_occupancy(actor)})
                 if len(parts) == 2 and parts[0] == "api":
                     body = self._body()
                     return self._send(
