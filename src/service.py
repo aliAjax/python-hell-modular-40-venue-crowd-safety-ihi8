@@ -2,7 +2,7 @@ from uuid import uuid4
 
 from .audit import AuditTrail
 from .domain import ConflictError, NotFoundError
-from .rules import RuleEngine
+from .rules import RuleEngine, assess_admission_batch
 
 
 class DomainService:
@@ -59,6 +59,46 @@ class DomainService:
             {"patch": patch},
         )
         return updated
+
+    def upload_admission_batch(self, actor, data):
+        payload = dict(data or {})
+        self.rules.validate_batch_upload(actor, payload, self._lookup)
+        batch_id = str(payload.pop("id", "") or uuid4())
+        if self.repository.get_entity(batch_id):
+            raise ConflictError("entity already exists: " + batch_id)
+        count = int(payload["count"])
+        payload["count"] = count
+        recorded_status = payload.get("zone_status")
+        recorded_generation = payload.get("zone_generation")
+
+        def decide(zone):
+            return assess_admission_batch(zone, count, recorded_status, recorded_generation)
+
+        batch, zone, deduplicated = self.repository.apply_admission_batch(
+            batch_id, payload, decide, actor.user_id
+        )
+        if deduplicated:
+            return {"batch": batch, "zone": zone, "deduplicated": True}
+        self.audit.record(
+            batch["id"], actor, "upload", None, batch["status"], {"kind": "admission_batch"}
+        )
+        if batch["status"] != "void":
+            self.audit.record(
+                zone["id"],
+                actor,
+                "reconcile",
+                zone["status"],
+                zone["status"],
+                {
+                    "batch_id": batch["id"],
+                    "batch_no": batch["data"].get("batch_no"),
+                    "gate_id": batch["data"].get("gate_id"),
+                    "count": count,
+                    "current_occupancy": zone["data"].get("current_occupancy"),
+                    "over_capacity_by": batch["data"].get("over_capacity_by", 0),
+                },
+            )
+        return {"batch": batch, "zone": zone, "deduplicated": False}
 
     def get(self, entity_id):
         entity = self.repository.get_entity(entity_id)

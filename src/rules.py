@@ -27,6 +27,31 @@ def capacity_available(capacity, occupancy, requested):
     return int(occupancy) + int(requested) <= int(capacity)
 
 
+def assess_admission_batch(zone, count, recorded_zone_status, recorded_generation=None):
+    """Decide how an offline admission batch reconciles with its zone.
+
+    Returns (batch_status, extra_batch_data, zone_patch). A batch recorded
+    under a stale zone state is voided and not counted; over-capacity
+    headcount is still counted as-is but flagged for commander review.
+    """
+    void_reason = None
+    if zone["status"] != recorded_zone_status:
+        void_reason = "zone status changed before batch upload"
+    elif recorded_generation is not None and int(
+        zone["data"].get("state_generation", 0)
+    ) != int(recorded_generation):
+        void_reason = "zone state changed before batch upload"
+    if void_reason:
+        return "void", {"void_reason": void_reason}, {}
+    occupancy = int(zone["data"].get("current_occupancy", 0))
+    capacity = int(zone["data"].get("capacity", 0))
+    new_occupancy = occupancy + int(count)
+    zone_patch = {"current_occupancy": new_occupancy}
+    if new_occupancy > capacity:
+        return "pending_review", {"over_capacity_by": new_occupancy - capacity}, zone_patch
+    return "applied", {"over_capacity_by": 0}, zone_patch
+
+
 def _validate_venue(actor, data, lookup):
     if not str(data.get("name", "")).strip():
         raise ValidationError("venue name is required")
@@ -38,7 +63,7 @@ def _validate_zone(actor, data, lookup):
         raise ValidationError("venue does not exist")
     if int(data.get("capacity", 0)) <= 0:
         raise ValidationError("zone capacity must be positive")
-    return {"current_occupancy": 0}
+    return {"current_occupancy": 0, "state_generation": 0}
 
 
 def _validate_gate(actor, data, lookup):
@@ -155,7 +180,12 @@ class RuleEngine:
         "medical_points": "medical_point",
         "incidents": "incident",
         "tasks": "task",
+        "admission_batches": "admission_batch",
+        "batches": "admission_batch",
     }
+    ZONE_STATUSES = ("closed", "open", "limited", "evacuating")
+    BATCH_UPLOAD_ROLES = ("operator", "supervisor", "admin")
+    BATCH_REQUIRED = ("gate_id", "zone_id", "count", "batch_no", "recorded_at", "zone_status")
     INITIAL_STATUS = {
         "venue": "ready",
         "zone": "closed",
@@ -209,6 +239,9 @@ class RuleEngine:
             "complete": (("on_scene",), "completed"),
             "cancel": (("draft", "assigned", "enroute", "on_scene"), "cancelled"),
         },
+        "admission_batch": {
+            "review": (("pending_review",), "reviewed"),
+        },
     }
     CREATE_REQUIRED = {
         "venue": ("name", "address"),
@@ -244,6 +277,7 @@ class RuleEngine:
         ("task", "arrive"): ("arrived_at",),
         ("task", "complete"): ("completed_at", "outcome"),
         ("task", "cancel"): ("reason",),
+        ("admission_batch", "review"): ("reviewer_id",),
     }
     CREATE_ROLES = {
         "venue": ("coordinator", "admin"),
@@ -276,6 +310,7 @@ class RuleEngine:
         "arrive": ("operator", "supervisor", "admin"),
         "complete": ("operator", "supervisor", "admin"),
         "cancel": ("supervisor", "coordinator", "admin"),
+        "review": ("coordinator", "admin"),
     }
     CUSTOM_CREATE = {
         "venue": _validate_venue,
@@ -340,4 +375,26 @@ class RuleEngine:
         patch = dict(data)
         if extra:
             patch.update(extra)
+        if kind == "zone" and next_status != entity["status"]:
+            patch["state_generation"] = int(entity["data"].get("state_generation", 0)) + 1
         return next_status, patch
+
+    def validate_batch_upload(self, actor, data, lookup=None):
+        self._ensure_role(actor, self.BATCH_UPLOAD_ROLES)
+        self._require(data, self.BATCH_REQUIRED)
+        try:
+            count = int(data.get("count"))
+        except (TypeError, ValueError):
+            raise ValidationError("batch count must be an integer")
+        if count <= 0:
+            raise ValidationError("batch count must be positive")
+        if data.get("zone_status") not in self.ZONE_STATUSES:
+            raise ValidationError("unknown zone status: " + str(data.get("zone_status")))
+        gate = _find_one(lookup, "gate", "id", data.get("gate_id"))
+        if not gate:
+            raise ValidationError("gate does not exist")
+        zone = _find_one(lookup, "zone", "id", data.get("zone_id"))
+        if not zone:
+            raise ValidationError("zone does not exist")
+        if zone["id"] not in (gate["data"].get("zone_ids") or []):
+            raise ValidationError("gate does not serve this zone")

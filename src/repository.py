@@ -2,7 +2,7 @@ import json
 import sqlite3
 from datetime import datetime, timezone
 
-from .domain import ConflictError, NotFoundError
+from .domain import ADMISSION_BATCH_COUNTED_STATUSES, ConflictError, NotFoundError
 
 
 def utcnow():
@@ -55,6 +55,40 @@ class SQLiteRepository:
                     PRIMARY KEY(actor_id, idem_key)
                 );
             """)
+            self._migrate(connection)
+
+    def _migrate(self, connection):
+        version = int(connection.execute("PRAGMA user_version").fetchone()[0])
+        if version >= 1:
+            return
+        # Upgrade from a pre-reconciliation database: backfill zone
+        # occupancy from the admission batches already uploaded.
+        self._backfill_zone_occupancy(connection)
+        connection.execute("PRAGMA user_version = 1")
+
+    def _backfill_zone_occupancy(self, connection):
+        rows = connection.execute(
+            "SELECT * FROM entities WHERE kind = 'admission_batch'"
+        ).fetchall()
+        totals = {}
+        for row in rows:
+            batch = self._entity_from_row(row)
+            if batch["status"] not in ADMISSION_BATCH_COUNTED_STATUSES:
+                continue
+            zone_id = batch["data"].get("zone_id")
+            if zone_id:
+                totals[zone_id] = totals.get(zone_id, 0) + int(batch["data"].get("count", 0))
+        now = utcnow()
+        for zone_id, occupancy in totals.items():
+            zone = self._fetch_entity(connection, zone_id)
+            if not zone or zone["kind"] != "zone":
+                continue
+            data = dict(zone["data"])
+            data["current_occupancy"] = occupancy
+            connection.execute(
+                "UPDATE entities SET data = ?, version = version + 1, updated_at = ? WHERE id = ?",
+                (json.dumps(data, ensure_ascii=False, sort_keys=True), now, zone_id),
+            )
 
     @staticmethod
     def _entity_from_row(row):
@@ -82,10 +116,78 @@ class SQLiteRepository:
 
     def get_entity(self, entity_id):
         with self._connect() as connection:
-            row = connection.execute(
-                "SELECT * FROM entities WHERE id = ?", (entity_id,)
-            ).fetchone()
+            return self._fetch_entity(connection, entity_id)
+
+    def _fetch_entity(self, connection, entity_id):
+        row = connection.execute(
+            "SELECT * FROM entities WHERE id = ?", (entity_id,)
+        ).fetchone()
         return self._entity_from_row(row) if row else None
+
+    def apply_admission_batch(self, batch_id, batch_data, decide, actor_id):
+        """Store an offline admission batch and reconcile its zone atomically.
+
+        ``decide(zone)`` is called inside the write transaction with the
+        zone's latest state and returns
+        ``(batch_status, extra_batch_data, zone_patch)``. Returns
+        ``(batch, zone, deduplicated)``; when a batch with the same
+        (gate_id, batch_no) was already recorded it is returned unchanged
+        and the zone is left untouched, so retries never double-count.
+        """
+        now = utcnow()
+        connection = self._connect()
+        try:
+            connection.execute("BEGIN IMMEDIATE")
+            gate_id = batch_data.get("gate_id")
+            batch_no = batch_data.get("batch_no")
+            rows = connection.execute(
+                "SELECT * FROM entities WHERE kind = 'admission_batch'"
+            ).fetchall()
+            for row in rows:
+                existing = self._entity_from_row(row)
+                if existing["data"].get("gate_id") == gate_id and str(
+                    existing["data"].get("batch_no")
+                ) == str(batch_no):
+                    zone = self._fetch_entity(connection, existing["data"].get("zone_id"))
+                    connection.commit()
+                    return existing, zone, True
+            zone = self._fetch_entity(connection, batch_data.get("zone_id"))
+            if not zone:
+                raise NotFoundError("zone not found: " + str(batch_data.get("zone_id")))
+            batch_status, extra, zone_patch = decide(zone)
+            payload = dict(batch_data)
+            if extra:
+                payload.update(extra)
+            connection.execute(
+                "INSERT INTO entities(id, kind, status, version, data, created_by, created_at, updated_at) "
+                "VALUES (?, 'admission_batch', ?, 1, ?, ?, ?, ?)",
+                (
+                    batch_id,
+                    batch_status,
+                    json.dumps(payload, ensure_ascii=False, sort_keys=True),
+                    actor_id,
+                    now,
+                    now,
+                ),
+            )
+            if zone_patch:
+                merged = dict(zone["data"])
+                merged.update(zone_patch)
+                connection.execute(
+                    "UPDATE entities SET version = version + 1, data = ?, updated_at = ? WHERE id = ?",
+                    (json.dumps(merged, ensure_ascii=False, sort_keys=True), now, zone["id"]),
+                )
+            connection.commit()
+        except Exception:
+            connection.rollback()
+            raise
+        finally:
+            connection.close()
+        return (
+            self.get_entity(batch_id),
+            self.get_entity(batch_data.get("zone_id")),
+            False,
+        )
 
     def list_entities(self, kind=None, status=None):
         clauses = []

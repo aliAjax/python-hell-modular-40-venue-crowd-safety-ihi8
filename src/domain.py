@@ -27,6 +27,10 @@ class InvalidTransition(DomainError):
     """The requested state transition is not valid."""
 
 
+# Admission batch statuses whose headcount is included in zone occupancy.
+ADMISSION_BATCH_COUNTED_STATUSES = ("applied", "pending_review", "reviewed")
+
+
 class Role(str, Enum):
     viewer = "viewer"
     reporter = "reporter"

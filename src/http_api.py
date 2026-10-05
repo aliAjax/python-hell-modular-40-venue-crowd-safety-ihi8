@@ -140,6 +140,9 @@ def create_handler(service, rules, static_dir):
                     )
                 if len(parts) == 2 and parts[0] == "api":
                     body = self._body()
+                    if rules.normalize_kind(parts[1]) == "admission_batch":
+                        result = service.upload_admission_batch(actor, body)
+                        return self._send(200 if result["deduplicated"] else 201, result)
                     return self._send(
                         201,
                         service.create(
